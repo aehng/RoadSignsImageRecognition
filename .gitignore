@@ -1,1 +1,12 @@
+# Python virtual environment
 /.venv
+
+# Data directory - ignore all images but keep CSVs and saved models
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.webp
+
+# (Intentionally NOT ignoring .csv and .keras files in roadsigns_data)
