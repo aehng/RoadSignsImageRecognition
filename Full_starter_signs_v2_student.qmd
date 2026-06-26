@@ -162,40 +162,63 @@ arrow_labels = [
 ]
 
 # ============================================================
-# SECTION 3: HIERARCHICAL ROUTING FUNCTION
+# SECTION 3: HIERARCHICAL ROUTING FUNCTION (BATCHED)
 # ============================================================
-# This function takes a single image, asks the router which
-# family it belongs to, then routes it to the correct expert
-# sub-model for final classification.
+# This function takes a BATCH of images, asks the router which
+# family each one belongs to, then routes each image to the
+# correct expert sub-model for final classification.
 # ============================================================
 
 # 3. ROUTING FUNCTION
-def hierarchical_inference(processed_image_batch):
-    # Ask the router
-    router_preds = model_router.predict(processed_image_batch, verbose=0)
-    predicted_family = router_labels[np.argmax(router_preds)]
-    
-    # Route to sub-model
-    if predicted_family == 'Family_Speed':
-        expert_preds = model_speed.predict(processed_image_batch, verbose=0)
-        final_text = speed_labels[np.argmax(expert_preds)]
-    elif predicted_family == 'Family_Arrow':
-        expert_preds = model_arrow.predict(processed_image_batch, verbose=0)
-        final_text = arrow_labels[np.argmax(expert_preds)]
-    elif predicted_family == 'Family_Hazard':
-        expert_preds = model_hazard.predict(processed_image_batch, verbose=0)
-        final_text = hazard_labels[np.argmax(expert_preds)]
-    else:
-        # Terminal unique shape (STOP, Yield, No_Entry)
-        if predicted_family == 'No_Entry':
-            final_text = 'No_Entry(one-way traffic)' # Map back to original messy string
-        elif predicted_family == 'Priority':
-            final_text = 'Priority_Road_Ahead' # Map back to yellow diamond original name
+def hierarchical_inference_batched(image_batch):
+    """Run hierarchical inference on a full batch of images at once."""
+    # Step 1: Ask the router to classify every image in the batch
+    router_preds = model_router.predict(image_batch, verbose=0)
+    predicted_families = np.argmax(router_preds, axis=1)  # indices into router_labels
+
+    # Prepare an array to hold the final predicted class index for each image
+    final_preds = np.zeros(len(image_batch), dtype=int)
+
+    # Step 2: Group images by predicted family
+    # For each family, collect the indices and images, then call the right expert
+    family_to_model = {
+        'Family_Speed': (model_speed, speed_labels),
+        'Family_Arrow': (model_arrow, arrow_labels),
+        'Family_Hazard': (model_hazard, hazard_labels),
+    }
+
+    # Map router label names to their index in router_labels
+    family_name_to_idx = {name: i for i, name in enumerate(router_labels)}
+
+    # Process each family group
+    for family_name, (expert_model, expert_labels) in family_to_model.items():
+        family_idx = family_name_to_idx[family_name]
+        # Find which images in the batch were routed to this family
+        mask = predicted_families == family_idx
+        if not np.any(mask):
+            continue  # No images for this expert, skip it
+        expert_images = image_batch[mask]
+        expert_preds = expert_model.predict(expert_images, verbose=0)
+        expert_class_indices = np.argmax(expert_preds, axis=1)
+        # Map expert label names to global target_names indices
+        for i, idx in enumerate(np.where(mask)[0]):
+            label_name = expert_labels[expert_class_indices[i]]
+            final_preds[idx] = target_names.index(label_name)
+
+    # Step 3: Handle terminal unique shapes (STOP, Yield, No_Entry, Priority)
+    for family_name in ['STOP', 'Yield', 'No_Entry', 'Priority']:
+        family_idx = family_name_to_idx[family_name]
+        mask = predicted_families == family_idx
+        if not np.any(mask):
+            continue
+        if family_name == 'No_Entry':
+            final_preds[mask] = target_names.index('No_Entry(one-way traffic)')
+        elif family_name == 'Priority':
+            final_preds[mask] = target_names.index('Priority_Road_Ahead')
         else:
-            final_text = predicted_family
-            
-    # Convert the final text name back into the official 0-42 integer!
-    return target_names.index(final_text)
+            final_preds[mask] = target_names.index(family_name)
+
+    return final_preds
 
 image_size = (100, 100)
 ```
@@ -221,23 +244,21 @@ validation_eval_datagen = ImageDataGenerator(
 val_eval_generator = validation_eval_datagen.flow_from_directory(
         training_dir,
         target_size=image_size,
-        batch_size=32,
+        batch_size=512,
         class_mode='sparse',
         subset="validation",
         seed=42,
         shuffle=False
 )
 
-# Route each validation image through the router + expert
+# Route each BATCH of validation images through the router + expert
 print("Routing validation images through hierarchical model...")
 val_predictions = []
 
 for i in range(len(val_eval_generator)):
     images, _ = val_eval_generator[i]
-    for img in images:
-        img_batch = np.expand_dims(img, axis=0)  # Shape: (1, 100, 100, 3)
-        pred_int = hierarchical_inference(img_batch)
-        val_predictions.append(pred_int)
+    batch_preds = hierarchical_inference_batched(images)
+    val_predictions.extend(batch_preds.tolist())
 
 # Extract true labels and compute accuracy
 y_true_val = val_eval_generator.classes
