@@ -100,12 +100,28 @@ import tensorflow as tf
 from sklearn.metrics import accuracy_score, classification_report
 import os
 
+# ============================================================
+# SECTION 1: LOAD TRAINED MODELS
+# ============================================================
+# We load the router model plus the three expert sub-models
+# (speed, arrow, hazard). These were trained separately and
+# saved as .keras files.
+# ============================================================
+
 # 1. LOAD ALL 4 TRAINED MODELS
 model_router = tf.keras.models.load_model(os.path.join(model_save_dir, 'router_model.keras'), compile=False)
 # Make sure you have trained and saved these other three before running this!
 model_speed  = tf.keras.models.load_model(os.path.join(model_save_dir, 'speed_model.keras'), compile=False)
 model_arrow  = tf.keras.models.load_model(os.path.join(model_save_dir, 'arrow_model.keras'), compile=False)
 model_hazard = tf.keras.models.load_model(os.path.join(model_save_dir, 'hazard_model.keras'), compile=False)
+
+# ============================================================
+# SECTION 2: LABEL LISTS
+# ============================================================
+# These lists must match the exact class order used during
+# training. The router predicts a family, then the expert
+# sub-model predicts a specific class within that family.
+# ============================================================
 
 # 2. DEFINE YOUR LABEL LISTS (Exactly as you trained them)
 target_names = ['Speed_20', 'Speed_30', 'Speed_50', 'Speed_60', 'Speed_70',
@@ -145,6 +161,14 @@ arrow_labels = [
     'Passing_Right_Compulsory', 'Passing_Left_Compulsory', 'Roundabout'
 ]
 
+# ============================================================
+# SECTION 3: HIERARCHICAL ROUTING FUNCTION
+# ============================================================
+# This function takes a single image, asks the router which
+# family it belongs to, then routes it to the correct expert
+# sub-model for final classification.
+# ============================================================
+
 # 3. ROUTING FUNCTION
 def hierarchical_inference(processed_image_batch):
     # Ask the router
@@ -174,6 +198,114 @@ def hierarchical_inference(processed_image_batch):
     return target_names.index(final_text)
 
 image_size = (100, 100)
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/}
+# ============================================================
+# SECTION 4: VALIDATION EVALUATION
+# ============================================================
+# Evaluate the hierarchical model on the validation set.
+# We recreate the exact same split as the training notebook
+# (seed=42, 80/20 split) so results are comparable.
+# ============================================================
+
+# 3b. VALIDATION EVALUATION (same split as training: seed=42, subset=.2)
+# Recreate the validation generator identically to the training notebook
+validation_eval_datagen = ImageDataGenerator(
+    rescale=1./255,
+    validation_split=.2,
+    preprocessing_function=val_preprocessing
+)
+
+val_eval_generator = validation_eval_datagen.flow_from_directory(
+        training_dir,
+        target_size=image_size,
+        batch_size=32,
+        class_mode='sparse',
+        subset="validation",
+        seed=42,
+        shuffle=False
+)
+
+# Route each validation image through the router + expert
+print("Routing validation images through hierarchical model...")
+val_predictions = []
+
+for i in range(len(val_eval_generator)):
+    images, _ = val_eval_generator[i]
+    for img in images:
+        img_batch = np.expand_dims(img, axis=0)  # Shape: (1, 100, 100, 3)
+        pred_int = hierarchical_inference(img_batch)
+        val_predictions.append(pred_int)
+
+# Extract true labels and compute accuracy
+y_true_val = val_eval_generator.classes
+
+val_accuracy = accuracy_score(y_true_val, val_predictions)
+print("\n" + "="*50)
+print(f"Overall Validation Accuracy: {val_accuracy * 100:.2f}%")
+print("="*50)
+
+# Print per-class precision, recall, and F1
+print("\nDetailed Validation Classification Report:")
+print(classification_report(y_true_val, val_predictions, labels=range(43), target_names=target_names))
+
+# Find all misclassified images
+wrong_indices_val = np.where(y_true_val != np.array(val_predictions))[0]
+total_wrong_val = len(wrong_indices_val)
+print(f"\nTotal misclassified validation images: {total_wrong_val} out of {len(y_true_val)}")
+
+print("\n" + "="*60)
+print(f"COMPLETE LIST OF VALIDATION MISCLASSIFICATIONS ({total_wrong_val} total):")
+print("="*60)
+
+for idx in wrong_indices_val:
+    img_path = val_eval_generator.filepaths[idx]
+    filename = os.path.basename(img_path)
+
+    true_label_name = target_names[y_true_val[idx]]
+    pred_label_name = target_names[val_predictions[idx]]
+
+    print(f"Image: {filename:<25} | True Class: {true_label_name:<20} -> Predicted: {pred_label_name}")
+
+print("="*60 + "\n")
+
+# Plot a sample of misclassified images (up to 200)
+max_images_to_show_val = min(200, total_wrong_val)
+images_to_show_val = wrong_indices_val[:max_images_to_show_val]
+
+print(f"Displaying the first {len(images_to_show_val)} misclassified validation images:")
+columns = 4
+rows = (len(images_to_show_val) + columns - 1) // columns
+plt.figure(figsize=(16, rows * 4))
+
+from tensorflow.keras.preprocessing.image import load_img
+for i, idx in enumerate(images_to_show_val):
+    img_path = val_eval_generator.filepaths[idx]
+    img = load_img(img_path)
+
+    true_label_name = target_names[y_true_val[idx]]
+    pred_label_name = target_names[val_predictions[idx]]
+
+    ax = plt.subplot(rows, columns, i + 1)
+    plt.imshow(img)
+    plt.title(f"True: {true_label_name}\nPred: {pred_label_name}", color='red', fontsize=10)
+    plt.axis('off')
+
+plt.tight_layout()
+plt.show()
+
+
+```
+
+```{python}
+# ============================================================
+# SECTION 5: MINI HOLDOUT EVALUATION
+# ============================================================
+# Evaluate on the mini holdout set (with known answers).
+# We load the true labels from the CSV and compare.
+# ============================================================
 
 # 4. RUN MINI HOLDOUT
 test_datagen = ImageDataGenerator(rescale=1./255, preprocessing_function=val_preprocessing)
@@ -184,6 +316,7 @@ test_generator = test_datagen.flow_from_directory(
         class_mode='sparse',
         shuffle=False)
 
+# Route each mini-holdout image through the router + expert
 print("Routing mini-holdout images...")
 predictions = []
 
@@ -195,7 +328,7 @@ for i in range(len(test_generator)):
         pred_int = hierarchical_inference(img_batch)
         predictions.append(pred_int)
 
-# 5. GRADE THE RESULTS
+# 5. GRADE THE RESULTS (compare predictions to ground truth CSV)
 answers_df = pd.read_csv(mini_holdout_answers)
 y_true = answers_df['ClassId'].values
 
@@ -205,15 +338,14 @@ print(classification_report(y_true, predictions, labels=range(43), target_names=
 ```
 
 ```{python}
-# 4. Print the detailed classification report (uses mini-holdout results from above)
-print("\nDetailed Mini-Holdout Classification Report:")
+# Mini-holdout: list and plot misclassified images
 
 # 5. Find all misclassified indices
 wrong_indices = np.where(y_true != np.array(predictions))[0]
 total_wrong = len(wrong_indices)
 print(f"\nTotal misclassified mini-holdout images: {total_wrong} out of {len(y_true)}")
 
-# 5b: Text print-out of all errors
+# 5b: Text print-out of all errors (filename + true vs predicted)
 print("\n" + "="*60)
 print(f"COMPLETE LIST OF MISCLASSIFICATIONS ({total_wrong} total):")
 print("="*60)
@@ -229,7 +361,7 @@ for idx in wrong_indices:
 
 print("="*60 + "\n")
 
-# 6. Plot a sample of the errors
+# 6. Plot a sample of the misclassified images (up to 200)
 max_images_to_show = min(200, total_wrong)
 images_to_show = wrong_indices[:max_images_to_show]
 
@@ -257,6 +389,13 @@ plt.show()
 ```
 
 ```{python}
+# ============================================================
+# SECTION 6: FULL HOLDOUT PREDICTIONS (SUBMISSION)
+# ============================================================
+# Generate predictions on the full holdout set and save to CSV
+# for submission. No ground truth is available here.
+# ============================================================
+
 # 4. RUN FULL HOLDOUT
 test_datagen = ImageDataGenerator(rescale=1./255, preprocessing_function=val_preprocessing)
 test_generator = test_datagen.flow_from_directory(
@@ -266,6 +405,7 @@ test_generator = test_datagen.flow_from_directory(
         class_mode='sparse',
         shuffle=False)
 
+# Route each holdout image through the router + expert
 print("Routing holdout images...")
 predictions = []
 
@@ -277,6 +417,7 @@ for i in range(len(test_generator)):
         pred_int = hierarchical_inference(img_batch)
         predictions.append(pred_int)
 
+# Save predictions to submission CSV
 predictions_df = pd.DataFrame({'predictions': predictions})
 submission_path = os.path.join(model_save_dir, 'Sanhedrine-transferE-module5-predictions.csv')
 predictions_df.to_csv(submission_path, index=False)
