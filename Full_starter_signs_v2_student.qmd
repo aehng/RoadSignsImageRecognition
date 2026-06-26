@@ -1,0 +1,287 @@
+---
+title: Testing the model
+jupyter: python3
+---
+
+```{python}
+# === CPU SETUP ===
+import tensorflow as tf
+import os
+
+# Detect CPU core count and configure threading
+cpu_count = os.cpu_count()
+print(f"CPU cores detected: {cpu_count}")
+
+# Set TensorFlow to use all available CPU threads for parallel operations
+tf.config.threading.set_intra_op_parallelism_threads(cpu_count)
+tf.config.threading.set_inter_op_parallelism_threads(cpu_count)
+
+# Optional: Set environment variables for MKL/oneDNN CPU acceleration
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '1'
+os.environ['KMP_BLOCKTIME'] = '0'
+os.environ['KMP_SETTINGS'] = '1'
+os.environ['OMP_NUM_THREADS'] = str(cpu_count)
+
+print("CPU threading and oneDNN optimizations configured.")
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/}
+import os
+import urllib.request
+import zipfile
+import shutil
+
+# === CONFIGURATION ===
+# Data is stored in a 'roadsigns_data' folder inside this repo/project directory.
+DATA_DIR = os.path.join(os.path.abspath('.'), 'roadsigns_data')
+# Or override manually, e.g.:
+# DATA_DIR = r'C:\Users\elijk\Documents\DS-450\signs\roadsigns_data'
+
+os.makedirs(DATA_DIR, exist_ok=True)
+
+training_dir = os.path.join(DATA_DIR, "training")
+holdout_dir = os.path.join(DATA_DIR, "holdout")
+mini_holdout_dir = os.path.join(DATA_DIR, "mini_holdout")
+mini_holdout_answers = os.path.join(DATA_DIR, "mini_holdout_answers.csv")
+
+model_save_dir = os.path.join(DATA_DIR, 'saved_models')
+os.makedirs(model_save_dir, exist_ok=True)
+```
+
+```{python}
+# Import libraries
+import pandas as pd
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+import matplotlib.pyplot as plt
+import numpy as np
+from tensorflow.keras import datasets, layers, models
+from tensorflow.keras.applications import MobileNetV2
+from sklearn.metrics import accuracy_score, classification_report
+import cv2
+import numpy as np
+```
+
+```{python}
+def apply_clahe_color(image):
+    """
+    Optimized CLAHE for small 100x100 images.
+    """
+    img_uint8 = image.astype(np.uint8)
+    lab = cv2.cvtColor(img_uint8, cv2.COLOR_RGB2LAB)
+    l_channel, a_channel, b_channel = cv2.split(lab)
+
+    # CHANGES:
+    # 1. Lowered clipLimit from 2.0 to 1.2 (prevents aggressive noise amplification)
+    # 2. Changed tileGridSize from (8,8) to (4,4) (creates larger 25x25 pixel tiles)
+    clahe = cv2.createCLAHE(clipLimit=1.1, tileGridSize=(4, 4))
+    cl = clahe.apply(l_channel)
+
+    merged_lab = cv2.merge((cl, a_channel, b_channel))
+    enhanced_rgb = cv2.cvtColor(merged_lab, cv2.COLOR_LAB2RGB)
+
+    return enhanced_rgb.astype(np.float32)
+
+
+def val_preprocessing(image):
+    """Applied to VALIDATION and TEST data: CLAHE enhancement ONLY"""
+    return apply_clahe_color(image)
+
+```
+
+
+
+```{python}
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from sklearn.metrics import accuracy_score, classification_report
+import os
+
+# 1. LOAD ALL 4 TRAINED MODELS
+model_router = tf.keras.models.load_model(os.path.join(model_save_dir, 'router_model.keras'), compile=False)
+# Make sure you have trained and saved these other three before running this!
+model_speed  = tf.keras.models.load_model(os.path.join(model_save_dir, 'speed_model.keras'), compile=False)
+model_arrow  = tf.keras.models.load_model(os.path.join(model_save_dir, 'arrow_model.keras'), compile=False)
+model_hazard = tf.keras.models.load_model(os.path.join(model_save_dir, 'hazard_model.keras'), compile=False)
+
+# 2. DEFINE YOUR LABEL LISTS (Exactly as you trained them)
+target_names = ['Speed_20', 'Speed_30', 'Speed_50', 'Speed_60', 'Speed_70',
+               'Speed_80','Speed_Limit_Ends', 'Speed_100', 'Speed_120', 'Overtaking_Prohibited',
+               'Overtaking_Prohibited_Trucks', 'Priority', 'Priority_Road_Ahead', 'Yield', 'STOP',
+               'Entry_Forbidden', 'Trucks_Forbidden', 'No_Entry(one-way traffic)', 'General Danger(!)', 'Left_Curve_Ahead',
+               'Right_Curve_Ahead', 'Double_Curve', 'Poor_Surface_Ahead', 'Slippery_Surface_Ahead', 'Road_Narrows_On_Right',
+               'Roadwork_Ahead', 'Traffic_Light_Ahead', 'Warning_Pedestrians', 'Warning_Children', 'Warning_Bikes',
+               'Ice_Snow', 'Deer_Crossing', 'End_Previous_Limitation', 'Turning_Right_Compulsory', 'Turning_Left_Compulsory',
+               'Ahead_Only', 'Straight_Or_Right_Mandatory', 'Straight_Or_Left_Mandatory', 'Passing_Right_Compulsory', 'Passing_Left_Compulsory',
+               'Roundabout', 'End_Overtaking_Prohibition', 'End_Overtaking_Prohibition_Trucks']
+
+router_labels = ['Family_Speed', 'Family_Arrow', 'Family_Hazard', 'STOP', 'Yield', 'Priority', 'No_Entry']
+
+# MUST contain all 16 circular classes in training order
+speed_labels = [
+    'Speed_20', 'Speed_30', 'Speed_50', 'Speed_60', 'Speed_70', 
+    'Speed_80', 'Speed_Limit_Ends', 'Speed_100', 'Speed_120', 
+    'Overtaking_Prohibited', 'Overtaking_Prohibited_Trucks', 
+    'Entry_Forbidden', 'Trucks_Forbidden', 'End_Previous_Limitation',
+    'End_Overtaking_Prohibition', 'End_Overtaking_Prohibition_Trucks'
+]
+
+# MUST contain all 15 hazard triangle classes in training order
+hazard_labels = [
+    'Priority', 'General Danger(!)', 'Left_Curve_Ahead',
+    'Right_Curve_Ahead', 'Double_Curve', 'Poor_Surface_Ahead', 
+    'Slippery_Surface_Ahead', 'Road_Narrows_On_Right', 'Roadwork_Ahead', 
+    'Traffic_Light_Ahead', 'Warning_Pedestrians', 'Warning_Children', 
+    'Warning_Bikes', 'Ice_Snow', 'Deer_Crossing'
+]
+
+# MUST contain all 8 blue arrow classes in training order
+arrow_labels = [
+    'Turning_Right_Compulsory', 'Turning_Left_Compulsory', 'Ahead_Only', 
+    'Straight_Or_Right_Mandatory', 'Straight_Or_Left_Mandatory', 
+    'Passing_Right_Compulsory', 'Passing_Left_Compulsory', 'Roundabout'
+]
+
+# 3. ROUTING FUNCTION
+def hierarchical_inference(processed_image_batch):
+    # Ask the router
+    router_preds = model_router.predict(processed_image_batch, verbose=0)
+    predicted_family = router_labels[np.argmax(router_preds)]
+    
+    # Route to sub-model
+    if predicted_family == 'Family_Speed':
+        expert_preds = model_speed.predict(processed_image_batch, verbose=0)
+        final_text = speed_labels[np.argmax(expert_preds)]
+    elif predicted_family == 'Family_Arrow':
+        expert_preds = model_arrow.predict(processed_image_batch, verbose=0)
+        final_text = arrow_labels[np.argmax(expert_preds)]
+    elif predicted_family == 'Family_Hazard':
+        expert_preds = model_hazard.predict(processed_image_batch, verbose=0)
+        final_text = hazard_labels[np.argmax(expert_preds)]
+    else:
+        # Terminal unique shape (STOP, Yield, No_Entry)
+        if predicted_family == 'No_Entry':
+            final_text = 'No_Entry(one-way traffic)' # Map back to original messy string
+        elif predicted_family == 'Priority':
+            final_text = 'Priority_Road_Ahead' # Map back to yellow diamond original name
+        else:
+            final_text = predicted_family
+            
+    # Convert the final text name back into the official 0-42 integer!
+    return target_names.index(final_text)
+
+image_size = (100, 100)
+
+# 4. RUN MINI HOLDOUT
+test_datagen = ImageDataGenerator(rescale=1./255, preprocessing_function=val_preprocessing)
+test_generator = test_datagen.flow_from_directory(
+        DATA_DIR,
+        classes=['mini_holdout'],
+        target_size=image_size,
+        class_mode='sparse',
+        shuffle=False)
+
+print("Routing mini-holdout images...")
+predictions = []
+
+# Loop through generator
+for i in range(len(test_generator)):
+    images, _ = test_generator[i]
+    for img in images:
+        img_batch = np.expand_dims(img, axis=0) # Shape: (1, 100, 100, 3)
+        pred_int = hierarchical_inference(img_batch)
+        predictions.append(pred_int)
+
+# 5. GRADE THE RESULTS
+answers_df = pd.read_csv(mini_holdout_answers)
+y_true = answers_df['ClassId'].values
+
+accuracy = accuracy_score(y_true, predictions)
+print(f"Mini Holdout Accuracy: {accuracy * 100:.2f}%")
+print(classification_report(y_true, predictions, labels=range(43), target_names=target_names))
+```
+
+```{python}
+# 4. Print the detailed classification report (uses mini-holdout results from above)
+print("\nDetailed Mini-Holdout Classification Report:")
+
+# 5. Find all misclassified indices
+wrong_indices = np.where(y_true != np.array(predictions))[0]
+total_wrong = len(wrong_indices)
+print(f"\nTotal misclassified mini-holdout images: {total_wrong} out of {len(y_true)}")
+
+# 5b: Text print-out of all errors
+print("\n" + "="*60)
+print(f"COMPLETE LIST OF MISCLASSIFICATIONS ({total_wrong} total):")
+print("="*60)
+
+for idx in wrong_indices:
+    img_path = test_generator.filepaths[idx]
+    filename = os.path.basename(img_path)
+
+    true_label_name = target_names[y_true[idx]]
+    pred_label_name = target_names[predictions[idx]]
+
+    print(f"Image: {filename:<25} | True Class: {true_label_name:<20} -> Predicted: {pred_label_name}")
+
+print("="*60 + "\n")
+
+# 6. Plot a sample of the errors
+max_images_to_show = min(200, total_wrong)
+images_to_show = wrong_indices[:max_images_to_show]
+
+print(f"Displaying the first {len(images_to_show)} misclassified images:")
+columns = 4
+rows = (len(images_to_show) + columns - 1) // columns
+plt.figure(figsize=(16, rows * 4))
+
+for i, idx in enumerate(images_to_show):
+    img_path = test_generator.filepaths[idx]
+
+    from tensorflow.keras.preprocessing.image import load_img
+    img = load_img(img_path)
+
+    true_label_name = target_names[y_true[idx]]
+    pred_label_name = target_names[predictions[idx]]
+
+    ax = plt.subplot(rows, columns, i + 1)
+    plt.imshow(img)
+    plt.title(f"True: {true_label_name}\nPred: {pred_label_name}", color='red', fontsize=10)
+    plt.axis('off')
+
+plt.tight_layout()
+plt.show()
+```
+
+```{python}
+# 4. RUN FULL HOLDOUT
+test_datagen = ImageDataGenerator(rescale=1./255, preprocessing_function=val_preprocessing)
+test_generator = test_datagen.flow_from_directory(
+        test_dir,
+        classes=['holdout'],
+        target_size=image_size,
+        class_mode='sparse',
+        shuffle=False)
+
+print("Routing holdout images...")
+predictions = []
+
+# Loop through generator
+for i in range(len(test_generator)):
+    images, _ = test_generator[i]
+    for img in images:
+        img_batch = np.expand_dims(img, axis=0) # Shape: (1, 100, 100, 3)
+        pred_int = hierarchical_inference(img_batch)
+        predictions.append(pred_int)
+
+predictions_df = pd.DataFrame({'predictions': predictions})
+submission_path = os.path.join(model_save_dir, 'Sanhedrine-transferE-module5-predictions.csv')
+predictions_df.to_csv(submission_path, index=False)
+print(f"Submission saved to: {submission_path}")
+print(f"Total predictions: {len(predictions)}")
+print(f"Unique classes: {len(set(predictions))}")
+print(f"Class range: {min(predictions)} to {max(predictions)}")
+```

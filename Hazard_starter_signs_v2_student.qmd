@@ -1,0 +1,705 @@
+---
+title: Testing the model
+jupyter: python3
+---
+
+```{python}
+# === CPU SETUP ===
+import tensorflow as tf
+import os
+
+# Detect CPU core count and configure threading
+cpu_count = os.cpu_count()
+print(f"CPU cores detected: {cpu_count}")
+
+# Set TensorFlow to use all available CPU threads for parallel operations
+tf.config.threading.set_intra_op_parallelism_threads(cpu_count)
+tf.config.threading.set_inter_op_parallelism_threads(cpu_count)
+
+# Optional: Set environment variables for MKL/oneDNN CPU acceleration
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '1'
+os.environ['KMP_BLOCKTIME'] = '0'
+os.environ['KMP_SETTINGS'] = '1'
+os.environ['OMP_NUM_THREADS'] = str(cpu_count)
+
+print("CPU threading and oneDNN optimizations configured.")
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/}
+import os
+import urllib.request
+import zipfile
+import shutil
+
+# === CONFIGURATION ===
+# Data is stored in a 'roadsigns_data' folder inside this repo/project directory.
+DATA_DIR = os.path.join(os.path.abspath('.'), 'roadsigns_data')
+# Or override manually, e.g.:
+# DATA_DIR = r'C:\Users\elijk\Documents\DS-450\signs\roadsigns_data'
+
+os.makedirs(DATA_DIR, exist_ok=True)
+
+training_dir = os.path.join(DATA_DIR, "training")
+holdout_dir = os.path.join(DATA_DIR, "holdout")
+mini_holdout_dir = os.path.join(DATA_DIR, "mini_holdout")
+mini_holdout_answers = os.path.join(DATA_DIR, "mini_holdout_answers.csv")
+```
+
+```{python}
+# Import libraries
+import pandas as pd
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+import matplotlib.pyplot as plt
+import numpy as np
+from tensorflow.keras import datasets, layers, models
+from tensorflow.keras.applications import MobileNetV2
+from sklearn.metrics import accuracy_score, classification_report
+import cv2
+import numpy as np
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/}
+# We're using keras' ImageDataGenerator class to load our image data.
+# See (https://keras.io/api/preprocessing/image/#imagedatagenerator-class) for details
+#
+# A couple of things to note:
+# 1. We're specifying a number for the seed, so we'll always get the same shuffle and split of our images.
+# 2. Class names are inferred automatically from the image subdirectory names.
+# 3. We're splitting the training data into 80% training, 20% validation.
+# 4. workers uses all CPU cores for parallel data loading.
+
+
+def apply_clahe_color(image):
+    """
+    Optimized CLAHE for small 100x100 images.
+    """
+    img_uint8 = image.astype(np.uint8)
+    lab = cv2.cvtColor(img_uint8, cv2.COLOR_RGB2LAB)
+    l_channel, a_channel, b_channel = cv2.split(lab)
+
+    # CHANGES:
+    # 1. Lowered clipLimit from 2.0 to 1.2 (prevents aggressive noise amplification)
+    # 2. Changed tileGridSize from (8,8) to (4,4) (creates larger 25x25 pixel tiles)
+    clahe = cv2.createCLAHE(clipLimit=1.1, tileGridSize=(4, 4))
+    cl = clahe.apply(l_channel)
+
+    merged_lab = cv2.merge((cl, a_channel, b_channel))
+    enhanced_rgb = cv2.cvtColor(merged_lab, cv2.COLOR_LAB2RGB)
+
+    return enhanced_rgb.astype(np.float32)
+
+
+def train_preprocessing(image):
+    """Applied to TRAINING data: CLAHE + random blurs + pixelation"""
+    # 1. LOW LIGHT ENHANCEMENT (Always runs first)
+    image = apply_clahe_color(image)
+
+    # 2. MOTION BLUR (20% chance) - Simulates speed streaks/vibrations
+    if np.random.rand() < 0.1:
+        intensity = 3
+        kernel = np.zeros((intensity, intensity))
+        kernel[int((intensity - 1) / 2), :] = np.ones(intensity)
+
+        # Random angle for the streak
+        angle = np.random.uniform(-20, 20)
+        rotation_matrix = cv2.getRotationMatrix2D((intensity / 2, intensity / 2), angle, 1)
+        kernel = cv2.warpAffine(kernel, rotation_matrix, (intensity, intensity))
+        kernel = kernel / np.sum(kernel)
+
+        image = cv2.filter2D(image, -1, kernel)
+
+    # # 3. GAUSSIAN BLUR (20% chance) - Simulates a dirty lens or defocus
+    # if np.random.rand() < 0.2:
+    #     # Keeping kernel sizes small so the image doesn't become completely unreadable
+    #     kernel_size = np.random.choice([3, 5])
+    #     image = cv2.GaussianBlur(image, (kernel_size, kernel_size), 0)
+
+    # # 4. PIXELATION / LOW-RES ARTIFACTS (25% chance) - Simulates low-res sensor or compression
+    # if np.random.rand() < 0.25:
+    #     h, w = image.shape[:2]
+    #     factor = np.random.choice([2, 3])
+    #     small_img = cv2.resize(image, (int(w / factor), int(h / factor)), interpolation=cv2.INTER_LINEAR)
+    #     image = cv2.resize(small_img, (w, h), interpolation=cv2.INTER_NEAREST)
+
+    return image
+
+
+def val_preprocessing(image):
+    """Applied to VALIDATION data: CLAHE enhancement ONLY (No random blurs or pixelation)"""
+    return apply_clahe_color(image)
+
+
+training_dir = os.path.join(DATA_DIR, 'training')
+image_size = (100, 100)
+
+# Split up the training data images into training and validations sets
+# We'll use and ImageDataGenerator to do the splits
+# ImageDataGenerator can also be used to do preprocessing and agumentation on the files as can be seen with rescale
+
+train_datagen = ImageDataGenerator(
+    rescale=1./255,
+    validation_split=.2,
+
+    # === CLAHE + HYBRID BLUR + PIXELATION IMPLEMENTATION ===
+    preprocessing_function=train_preprocessing, 
+    # === GEOMETRIC AUGMENTATIONS ===
+    rotation_range=5,
+    width_shift_range=0.05,
+    height_shift_range=0.05,
+    shear_range=5,
+    zoom_range=0.1,
+
+    # === COLOR & BRIGHTNESS ===
+    brightness_range=[0.85, 1.15],
+    channel_shift_range=0.01,
+
+    # === CANVAS FILL STRATEGY ===
+    fill_mode='nearest',
+)
+
+# Remember: Keep validation clean so your evaluation metrics are realistic!
+# Apply CLAHE to validation too so the model sees consistently enhanced images.
+validation_datagen = ImageDataGenerator(
+    rescale=1./255,
+    validation_split=.2,
+
+    preprocessing_function=val_preprocessing
+)
+
+import os
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+
+# === 1. DEFINE YOUR LABELS AND DIRECT MAPPING ===
+# The 15 specific classes the Hazard model needs to learn
+hazard_labels = [
+    'Priority', #  (Index 11)
+    'General Danger(!)', 
+    'Left_Curve_Ahead',
+    'Right_Curve_Ahead', 
+    'Double_Curve', 
+    'Poor_Surface_Ahead', 
+    'Slippery_Surface_Ahead', 
+    'Road_Narrows_On_Right',
+    'Roadwork_Ahead', 
+    'Traffic_Light_Ahead', 
+    'Warning_Pedestrians', 
+    'Warning_Children', 
+    'Warning_Bikes',
+    'Ice_Snow', 
+    'Deer_Crossing'
+]
+
+# Dictionary mapping the physical folders directly to the specific hazard names
+hazard_mapping = {
+    11: 'Priority', # Upward red triangle with crossroad
+    18: 'General Danger(!)',
+    19: 'Left_Curve_Ahead',
+    20: 'Right_Curve_Ahead',
+    21: 'Double_Curve',
+    22: 'Poor_Surface_Ahead',
+    23: 'Slippery_Surface_Ahead',
+    24: 'Road_Narrows_On_Right',
+    25: 'Roadwork_Ahead',
+    26: 'Traffic_Light_Ahead',
+    27: 'Warning_Pedestrians',
+    28: 'Warning_Children',
+    29: 'Warning_Bikes',
+    30: 'Ice_Snow',
+    31: 'Deer_Crossing'
+}
+
+# === 2. BUILD THE DATAFRAME FROM NUMBERED FOLDERS ===
+all_filepaths = []
+all_labels = []
+
+for folder_name in os.listdir(training_dir):
+    folder_path = os.path.join(training_dir, folder_name)
+    
+    # Filter for Hazard folders only
+    if os.path.isdir(folder_path) and folder_name.isdigit():
+        class_idx = int(folder_name)
+        
+        if class_idx in hazard_mapping:
+            specific_label = hazard_mapping[class_idx]
+            
+            for img in os.listdir(folder_path):
+                if img.lower().endswith(('.png', '.jpg', '.jpeg')):
+                    all_filepaths.append(os.path.join(folder_name, img))
+                    all_labels.append(specific_label)
+
+df = pd.DataFrame({'filename': all_filepaths, 'label': all_labels})
+
+# === 3. STRATIFIED TRAIN/VAL SPLIT ===
+# Split the filtered DataFrame
+train_df, val_df = train_test_split(
+    df, 
+    test_size=0.2, 
+    random_state=42, 
+    stratify=df['label'] 
+)
+
+# === 4. DEFINE GENERATORS ===
+train_datagen = ImageDataGenerator(
+    rescale=1./255,
+    preprocessing_function=train_preprocessing, 
+    rotation_range=10,
+    width_shift_range=0.05,
+    height_shift_range=0.05,
+    shear_range=5,
+    zoom_range=0.2,
+    brightness_range=[0.75, 1.25],
+    channel_shift_range=0.01,
+    fill_mode='nearest'
+)
+
+validation_datagen = ImageDataGenerator(
+    rescale=1./255,
+    preprocessing_function=val_preprocessing
+)
+
+# === 5. FLOW FROM DATAFRAME ===
+train_generator = train_datagen.flow_from_dataframe(
+        dataframe=train_df,
+        directory=training_dir,
+        x_col='filename',
+        y_col='label',
+        target_size=image_size,
+        batch_size=256,
+        class_mode='sparse',
+        classes=hazard_labels, 
+        seed=42, 
+        shuffle=True)
+
+validation_generator = validation_datagen.flow_from_dataframe(
+        dataframe=val_df,
+        directory=training_dir,
+        x_col='filename',
+        y_col='label',
+        target_size=image_size,
+        batch_size=256,
+        class_mode='sparse',
+        classes=hazard_labels, 
+        seed=42,
+        shuffle=False)
+
+print(f"\nTraining samples:   {train_generator.samples}")
+print(f"Validation samples: {validation_generator.samples}")
+print(f"Number of classes:  {len(train_generator.class_indices)}") 
+```
+
+
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 829}
+# View 9 images and their class labels
+plt.figure(figsize=(10, 10))
+images, labels = next(train_generator)  # Assuming train_generator is a generator
+batch_size = images.shape[0]
+
+for i in range(min(9, batch_size)):
+    ax = plt.subplot(3, 3, i + 1)
+    plt.imshow((images[i] * 255).astype("uint8"))
+    plt.title(int(labels[i]))
+    plt.axis("off")
+
+plt.show()
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/, height: 506}
+from tensorflow.keras import layers, models, Input
+
+# 0. Make sure the save directory exists (defined early so the model-building cell can use it)
+model_save_dir = os.path.join(DATA_DIR, 'saved_models')
+os.makedirs(model_save_dir, exist_ok=True)
+
+# 1. Load the best 43-class model as a base (transfer learning)
+base_model_path = os.path.join(model_save_dir, 'best_road_signs_f1_model.keras')
+base_model = tf.keras.models.load_model(base_model_path, compile=False)
+print(f"Loaded base model from: {base_model_path}")
+
+# 2. Freeze the entire base model (backbone + original head)
+base_model.trainable = False
+
+# 3. Build a NEW head on top of the base model's penultimate layer
+inputs = Input(shape=(100, 100, 3))
+
+x = base_model.get_layer('rescaling_1')(inputs)
+x = base_model.get_layer('mobilenetv2_1.00_224')(x, training=False)
+x = base_model.get_layer('global_average_pooling2d_1')(x)
+x = base_model.get_layer('dropout_2')(x)
+x = base_model.get_layer('dense_2')(x)          # 128-unit feature layer
+x = base_model.get_layer('dropout_3')(x)
+
+# 4. NEW classification head for 15 hazard classes
+x = layers.Dense(256, activation='relu', name='hazard_dense_1')(x)
+x = layers.Dropout(0.4, name='hazard_drop_1')(x)
+x = layers.Dense(128, activation='relu', name='hazard_dense_2')(x)
+x = layers.Dropout(0.3, name='hazard_drop_2')(x)
+outputs = layers.Dense(15, name='hazard_output')(x)  # Raw logits for 15 hazard classes
+
+# Bind inputs and outputs into the final model object
+model = models.Model(inputs, outputs, name="Hazard_transfer_from_best")
+
+# View your corrected architecture layout
+model.summary()
+```
+
+
+
+```{python}
+# 1. Create a custom wrapper to handle sparse integer labels on the fly
+class SparseF1Score(tf.keras.metrics.F1Score):
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        # Flatten the sparse target and convert to one-hot encoding (15 classes)
+        y_true_one_hot = tf.one_hot(tf.cast(tf.reshape(y_true, [-1]), tf.int32), depth=15)
+        return super().update_state(y_true_one_hot, y_pred, sample_weight)
+
+# Use our new custom sparse wrapper
+f1_metric = SparseF1Score(average="macro", name="f1_score")
+
+# 2. Compile using SPARSE loss exactly like you had it
+model.compile(
+    optimizer='adam',
+    loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+    metrics=['accuracy', f1_metric]
+)
+
+# 3. Early Stopping and Checkpoint monitors stay the same
+early_stopping = tf.keras.callbacks.EarlyStopping(
+    monitor='val_f1_score',
+    patience=3,
+    restore_best_weights=True
+)
+
+checkpoint_path = os.path.join(model_save_dir, 'hazard_model.keras')
+
+checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
+    filepath=checkpoint_path,
+    monitor='val_f1_score',
+    save_best_only=True,
+    mode='max',
+    verbose=1
+)
+
+print(f"Checkpoint will be saved to: {checkpoint_path}")
+
+# 4. Fit the model — Phase 1: train the new head only (backbone frozen)
+history = model.fit(
+    train_generator,
+    epochs=50,
+    validation_data=validation_generator,
+    callbacks=[checkpoint_callback, early_stopping]
+)
+```
+
+```{python}
+# plt.plot(history.history['accuracy'], label='accuracy')
+# plt.plot(history.history['val_accuracy'], label = 'val_accuracy')
+# plt.xlabel('Epoch')
+# plt.ylabel('Accuracy')
+# plt.ylim([0.5, 1])
+# plt.legend(loc='lower right')
+
+# # Unpack all 3 values returned by the model
+# test_loss, test_acc, test_f1 = model.evaluate(validation_generator, verbose=2)
+
+# print(f"Validation Loss:     {test_loss:.4f}")
+# print(f"Validation Accuracy: {test_acc * 100:.2f}%")
+# print(f"Validation F1-Score: {test_f1:.4f}")
+```
+
+```{python}
+#| colab: {base_uri: https://localhost:8080/}
+from tensorflow.keras.models import load_model
+import tensorflow as tf
+
+# 1. Load your absolute best weights from the local checkpoint
+print("Loading the peak model checkpoint...")
+model = load_model(
+    checkpoint_path,
+    custom_objects={'SparseF1Score': SparseF1Score}
+)
+
+# 2. Extract the MobileNetV2 backbone from the loaded base model
+base_model_layer = base_model.get_layer('mobilenetv2_1.00_224')
+
+# 3. SURGICAL UNFREEZE: Loop through and keep BatchNormalization locked down!
+base_model_layer.trainable = True
+for layer in base_model_layer.layers:
+    if isinstance(layer, tf.keras.layers.BatchNormalization) or 'BatchNormalization' in layer.__class__.__name__:
+        layer.trainable = False
+
+# 4. Recompile with your microscopic fine-tuning learning rate
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(learning_rate=0.00001),
+    loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+    metrics=['accuracy', f1_metric]
+)
+
+# 5. Set up the clean fine-tuning Early Stopping monitor
+early_stopping_ft = tf.keras.callbacks.EarlyStopping(
+    monitor='val_f1_score',
+    patience=5,
+    restore_best_weights=True
+)
+
+# 6. Fine-tune smoothly
+history_fine_tune = model.fit(
+    train_generator,
+    epochs=10,
+    validation_data=validation_generator,
+    callbacks=[checkpoint_callback, early_stopping_ft]
+)
+```
+
+```{python}
+plt.plot(history_fine_tune.history['accuracy'], label='accuracy')
+plt.plot(history_fine_tune.history['val_accuracy'], label = 'val_accuracy')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.ylim([0.5, 1])
+plt.legend(loc='lower right')
+
+# Unpack all 3 values returned by the model
+test_loss, test_acc, test_f1 = model.evaluate(validation_generator, verbose=2)
+
+print(f"Validation Loss:     {test_loss:.4f}")
+print(f"Validation Accuracy: {test_acc * 100:.2f}%")
+print(f"Validation F1-Score: {test_f1:.4f}")
+```
+
+```{python}
+predictions = model.predict(validation_generator)
+```
+
+# 1. Create a fresh, dedicated evaluation generator to completely avoid the shuffle trap
+```{python}
+val_eval_generator = validation_datagen.flow_from_dataframe(
+        dataframe=val_df,             # Use your pandas validation dataframe
+        directory=training_dir,       # Point to the root training folder
+        x_col='filename',
+        y_col='label',
+        target_size=image_size,
+        batch_size=32,
+        class_mode='sparse',
+        classes=hazard_labels,        # Enforce the 15 class mapping
+        seed=42,
+        shuffle=False                 # Unshuffled from the very start
+)
+
+print("Generating predictions for the validation dataset...")
+val_probabilities = model.predict(val_eval_generator)
+val_predictions = np.argmax(val_probabilities, axis=1)
+
+# 2. Extract the true validation labels
+y_true_val = val_eval_generator.classes
+
+# 3. Calculate and print overall validation accuracy
+val_accuracy = accuracy_score(y_true_val, val_predictions)
+print("\n" + "="*50)
+print(f"Overall Validation Accuracy: {val_accuracy * 100:.2f}%")
+print("="*50)
+
+# 4. Print the detailed classification report
+print("\nDetailed Validation Classification Report:")
+# UPDATED: Changed range(43) to range(15) to match your hazard_labels
+print(classification_report(y_true_val, val_predictions, labels=range(15), target_names=hazard_labels))
+
+# 5. Find all misclassified indices
+wrong_indices_val = np.where(y_true_val != val_predictions)[0]
+total_wrong = len(wrong_indices_val)
+print(f"\nTotal misclassified validation images: {total_wrong} out of {len(y_true_val)}")
+
+# === ADDED SECTION 5b: TEXT PRINT OUT OF ALL ERRORS ===
+print("\n" + "="*60)
+print(f"COMPLETE LIST OF MISCLASSIFICATIONS ({total_wrong} total):")
+print("="*60)
+
+for idx in wrong_indices_val:
+    img_path = val_eval_generator.filepaths[idx]
+    filename = os.path.basename(img_path) # Extracts just the 'image.jpg' from the full path
+    
+    true_label_name = hazard_labels[y_true_val[idx]]
+    pred_label_name = hazard_labels[val_predictions[idx]]
+    
+    print(f"Image: {filename:<25} | True Class: {true_label_name:<20} -> Predicted: {pred_label_name}")
+
+print("="*60 + "\n")
+# ======================================================
+
+# 6. Plot a safe sample of the errors (First 16 images)
+max_images_to_show = 200
+images_to_show = wrong_indices_val[:max_images_to_show]
+
+print(f"Displaying the first {len(images_to_show)} misclassified images:")
+columns = 4
+rows = (len(images_to_show) + columns - 1) // columns
+plt.figure(figsize=(16, rows * 4))
+
+for i, idx in enumerate(images_to_show):
+    img_path = val_eval_generator.filepaths[idx]
+    
+    # Keras loads the image easily
+    from tensorflow.keras.preprocessing.image import load_img
+    img = load_img(img_path)
+
+    true_label_name = hazard_labels[y_true_val[idx]]
+    pred_label_name = hazard_labels[val_predictions[idx]]
+
+    ax = plt.subplot(rows, columns, i + 1)
+    plt.imshow(img)
+    plt.title(f"True: {true_label_name}\nPred: {pred_label_name}", color='red', fontsize=10)
+    plt.axis('off')
+
+plt.tight_layout()
+plt.show()
+```
+
+Once you have built and trained your model, the next step is to run the mini holdout images through it and see how well your model does at making predictions for images it has never seen before.
+
+Since loading these images and formatting them for the model can be tricky, you may find the following code useful. This code only uses your model to predict the class label for a given image. You'll still need to compare those predictions to the "ground truth" class labels in `mini_holdout_answers.csv` to evaluate how well the model does.
+
+Make sure to use the insights gained from the mini hold out dataset in your executive summary.
+
+```python
+from tensorflow.keras.preprocessing import image_dataset_from_directory
+
+test_dir = DATA_DIR  # Points to your local roadsigns_data folder
+
+test_datagen = ImageDataGenerator(rescale=1./255)
+test_generator = test_datagen.flow_from_directory(
+        test_dir,
+        classes=['mini_holdout'],
+        target_size=image_size,
+        class_mode='sparse',
+        shuffle=False)
+probabilities = model.predict(test_generator)
+predictions = [np.argmax(probas) for probas in probabilities]
+```
+
+
+```{python}
+from tensorflow.keras.preprocessing import image_dataset_from_directory
+
+test_dir = DATA_DIR  # Points to your local roadsigns_data folder
+
+# Apply CLAHE to test images too so the model sees consistently enhanced input
+test_datagen = ImageDataGenerator(rescale=1./255, preprocessing_function=val_preprocessing)
+test_generator = test_datagen.flow_from_directory(
+        test_dir,
+        classes=['mini_holdout'],
+        target_size=image_size,
+        class_mode='sparse',
+        shuffle=False)
+probabilities = model.predict(test_generator)
+predictions = [np.argmax(probas) for probas in probabilities]
+
+# Save to local CSV — single column, header "predictions", no index
+predictions_df = pd.DataFrame({'predictions': predictions})
+submission_path = os.path.join(model_save_dir, 'Sanhedrine-transferE-module5-mini-predictions.csv')
+predictions_df.to_csv(submission_path, index=False)
+print(f"Submission saved to: {submission_path}")
+print(f"Total predictions: {len(predictions)}")
+print(f"Unique classes: {len(set(predictions))}")
+print(f"Class range: {min(predictions)} to {max(predictions)}")
+```
+
+```{python}
+import pandas as pd
+from sklearn.metrics import accuracy_score, classification_report
+
+# 1. Load the correct answers from local path
+answers_df = pd.read_csv(mini_holdout_answers)
+
+# Take a quick look at the first few rows to confirm the column name
+print("CSV Columns:", answers_df.columns.tolist())
+print(answers_df.head(), "\n" + "="*50)
+
+# 2. Extract the true class labels
+y_true = answers_df['ClassId'].values
+
+# 3. Calculate and print the overall accuracy
+accuracy = accuracy_score(y_true, predictions)
+print(f"Mini Holdout Accuracy: {accuracy * 100:.2f}%")
+
+# 4. Show a detailed breakdown per road sign class
+print("\nClassification Report:")
+# Add labels=range(15) to force it to map all 15 target names correctly
+print(classification_report(y_true, predictions, labels=range(15), target_names=hazard_labels))
+```
+
+```{python}
+from tensorflow.keras.preprocessing.image import load_img
+
+# 1. Find the index of every image where the prediction didn't match the true answer
+wrong_indices = np.where(y_true != np.array(predictions))[0]
+print(f"Total misclassified images: {len(wrong_indices)} out of {len(y_true)}")
+
+# 2. Set up a dynamic grid to display them (4 images per row)
+columns = 4
+rows = (len(wrong_indices) + columns - 1) // columns
+plt.figure(figsize=(16, rows * 4))
+
+# 3. Loop through the wrong entries, load their images, and plot them
+for i, idx in enumerate(wrong_indices):
+    # Grab the exact file path from the generator's internal file list
+    img_path = test_generator.filepaths[idx]
+    img = load_img(img_path)
+
+    # Get the text names for both labels
+    true_label_name = hazard_labels[y_true[idx]]
+    pred_label_name = hazard_labels[predictions[idx]]
+
+    # Plotting
+    ax = plt.subplot(rows, columns, i + 1)
+    plt.imshow(img)
+    plt.title(f"True: {true_label_name}\nPred: {pred_label_name}", color='red', fontsize=10)
+    plt.axis('off')
+
+plt.tight_layout()
+plt.show()
+```
+
+## Full Holdout Predictions — Submission
+
+Run this cell to generate your submission CSV. The file will be saved in the `saved_models` folder inside your `roadsigns_data` directory.
+
+**CSV format requirements:**
+- Single column with header `predictions` (no quotes)
+- One prediction per row (integer class IDs)
+- No index column
+- Filename format: `team8-module2-predictions.csv` *(replace with your team #)*
+
+```{python}
+from tensorflow.keras.preprocessing import image_dataset_from_directory
+
+test_dir = DATA_DIR  # Points to your local roadsigns_data folder
+
+# Apply CLAHE to test images too so the model sees consistently enhanced input
+test_datagen = ImageDataGenerator(rescale=1./255, preprocessing_function=val_preprocessing)
+test_generator = test_datagen.flow_from_directory(
+        test_dir,
+        classes=['holdout'],
+        target_size=image_size,
+        class_mode='sparse',
+        shuffle=False)
+probabilities = model.predict(test_generator)
+predictions = [np.argmax(probas) for probas in probabilities]
+
+# Save to local CSV — single column, header "predictions", no index
+predictions_df = pd.DataFrame({'predictions': predictions})
+submission_path = os.path.join(model_save_dir, 'Sanhedrine-transferE-module5-predictions.csv')
+predictions_df.to_csv(submission_path, index=False)
+print(f"Submission saved to: {submission_path}")
+print(f"Total predictions: {len(predictions)}")
+print(f"Unique classes: {len(set(predictions))}")
+print(f"Class range: {min(predictions)} to {max(predictions)}")
+```
+
