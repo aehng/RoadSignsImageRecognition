@@ -337,17 +337,15 @@ test_generator = test_datagen.flow_from_directory(
         class_mode='sparse',
         shuffle=False)
 
-# Route each mini-holdout image through the router + expert
+# Route each BATCH of mini-holdout images through the router + expert
 print("Routing mini-holdout images...")
 predictions = []
 
 # Loop through generator
 for i in range(len(test_generator)):
     images, _ = test_generator[i]
-    for img in images:
-        img_batch = np.expand_dims(img, axis=0) # Shape: (1, 100, 100, 3)
-        pred_int = hierarchical_inference(img_batch)
-        predictions.append(pred_int)
+    batch_preds = hierarchical_inference_batched(images)
+    predictions.extend(batch_preds.tolist())
 
 # 5. GRADE THE RESULTS (compare predictions to ground truth CSV)
 answers_df = pd.read_csv(mini_holdout_answers)
@@ -420,23 +418,22 @@ plt.show()
 # 4. RUN FULL HOLDOUT
 test_datagen = ImageDataGenerator(rescale=1./255, preprocessing_function=val_preprocessing)
 test_generator = test_datagen.flow_from_directory(
-        test_dir,
+        DATA_DIR,
         classes=['holdout'],
         target_size=image_size,
+        batch_size=256,
         class_mode='sparse',
         shuffle=False)
 
-# Route each holdout image through the router + expert
+# Route each BATCH of holdout images through the router + expert
 print("Routing holdout images...")
 predictions = []
 
 # Loop through generator
 for i in range(len(test_generator)):
     images, _ = test_generator[i]
-    for img in images:
-        img_batch = np.expand_dims(img, axis=0) # Shape: (1, 100, 100, 3)
-        pred_int = hierarchical_inference(img_batch)
-        predictions.append(pred_int)
+    batch_preds = hierarchical_inference_batched(images)
+    predictions.extend(batch_preds.tolist())
 
 # Save predictions to submission CSV
 predictions_df = pd.DataFrame({'predictions': predictions})
