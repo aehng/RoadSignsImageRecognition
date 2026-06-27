@@ -1,0 +1,450 @@
+---
+title: "Model Speed Benchmark: Hierarchical vs Single F1 Model"
+jupyter: python3
+---
+
+## Setup: CPU Configuration & Imports
+
+```{python}
+# === CPU SETUP ===
+import tensorflow as tf
+import os
+
+cpu_count = os.cpu_count()
+print(f"CPU cores detected: {cpu_count}")
+
+tf.config.threading.set_intra_op_parallelism_threads(cpu_count)
+tf.config.threading.set_inter_op_parallelism_threads(cpu_count)
+
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '1'
+os.environ['KMP_BLOCKTIME'] = '0'
+os.environ['KMP_SETTINGS'] = '1'
+os.environ['OMP_NUM_THREADS'] = str(cpu_count)
+
+print("CPU threading and oneDNN optimizations configured.")
+```
+
+```{python}
+import os
+import time
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from tensorflow.keras.preprocessing.image import ImageDataGenerator, load_img, img_to_array
+import cv2
+import matplotlib.pyplot as plt
+from sklearn.metrics import accuracy_score, classification_report
+
+# === PATHS ===
+DATA_DIR = os.path.join(os.path.abspath('.'), 'roadsigns_data')
+model_save_dir = os.path.join(DATA_DIR, 'saved_models')
+training_dir = os.path.join(DATA_DIR, 'training')
+holdout_dir = os.path.join(DATA_DIR, 'holdout')
+mini_holdout_dir = os.path.join(DATA_DIR, 'mini_holdout')
+mini_holdout_answers = os.path.join(DATA_DIR, 'mini_holdout_answers.csv')
+
+image_size = (100, 100)
+```
+
+## Preprocessing (shared by both models)
+
+```{python}
+def apply_clahe_color(image):
+    """Optimized CLAHE for small 100x100 images."""
+    img_uint8 = image.astype(np.uint8)
+    lab = cv2.cvtColor(img_uint8, cv2.COLOR_RGB2LAB)
+    l_channel, a_channel, b_channel = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=1.1, tileGridSize=(4, 4))
+    cl = clahe.apply(l_channel)
+    merged_lab = cv2.merge((cl, a_channel, b_channel))
+    enhanced_rgb = cv2.cvtColor(merged_lab, cv2.COLOR_LAB2RGB)
+    return enhanced_rgb.astype(np.float32)
+
+
+def val_preprocessing(image):
+    """Applied to VALIDATION and TEST data: CLAHE enhancement ONLY"""
+    return apply_clahe_color(image)
+```
+
+## Load Models
+
+```{python}
+# === LOAD SINGLE F1 MODEL ===
+print("Loading single F1 model...")
+model_single = tf.keras.models.load_model(
+    os.path.join(model_save_dir, 'best_road_signs_f1_model.keras'),
+    compile=False
+)
+print(f"Single model input shape: {model_single.input_shape}")
+print(f"Single model output classes: {model_single.output_shape}")
+```
+
+```{python}
+# === LOAD HIERARCHICAL MODELS ===
+print("Loading hierarchical models...")
+model_router = tf.keras.models.load_model(
+    os.path.join(model_save_dir, 'router_model.keras'), compile=False)
+model_speed  = tf.keras.models.load_model(
+    os.path.join(model_save_dir, 'speed_model.keras'), compile=False)
+model_arrow  = tf.keras.models.load_model(
+    os.path.join(model_save_dir, 'arrow_model.keras'), compile=False)
+model_hazard = tf.keras.models.load_model(
+    os.path.join(model_save_dir, 'hazard_model.keras'), compile=False)
+print("All 4 hierarchical models loaded.")
+```
+
+## Label Definitions & Routing Logic
+
+```{python}
+# === LABEL LISTS ===
+target_names = ['Speed_20', 'Speed_30', 'Speed_50', 'Speed_60', 'Speed_70',
+               'Speed_80','Speed_Limit_Ends', 'Speed_100', 'Speed_120', 'Overtaking_Prohibited',
+               'Overtaking_Prohibited_Trucks', 'Priority', 'Priority_Road_Ahead', 'Yield', 'STOP',
+               'Entry_Forbidden', 'Trucks_Forbidden', 'No_Entry(one-way traffic)', 'General Danger(!)', 'Left_Curve_Ahead',
+               'Right_Curve_Ahead', 'Double_Curve', 'Poor_Surface_Ahead', 'Slippery_Surface_Ahead', 'Road_Narrows_On_Right',
+               'Roadwork_Ahead', 'Traffic_Light_Ahead', 'Warning_Pedestrians', 'Warning_Children', 'Warning_Bikes',
+               'Ice_Snow', 'Deer_Crossing', 'End_Previous_Limitation', 'Turning_Right_Compulsory', 'Turning_Left_Compulsory',
+               'Ahead_Only', 'Straight_Or_Right_Mandatory', 'Straight_Or_Left_Mandatory', 'Passing_Right_Compulsory', 'Passing_Left_Compulsory',
+               'Roundabout', 'End_Overtaking_Prohibition', 'End_Overtaking_Prohibition_Trucks']
+
+router_labels = ['Family_Speed', 'Family_Arrow', 'Family_Hazard', 'STOP', 'Yield', 'Priority', 'No_Entry']
+
+speed_labels = [
+    'Speed_20', 'Speed_30', 'Speed_50', 'Speed_60', 'Speed_70', 
+    'Speed_80', 'Speed_Limit_Ends', 'Speed_100', 'Speed_120', 
+    'Overtaking_Prohibited', 'Overtaking_Prohibited_Trucks', 
+    'Entry_Forbidden', 'Trucks_Forbidden', 'End_Previous_Limitation',
+    'End_Overtaking_Prohibition', 'End_Overtaking_Prohibition_Trucks'
+]
+
+hazard_labels = [
+    'Priority', 'General Danger(!)', 'Left_Curve_Ahead',
+    'Right_Curve_Ahead', 'Double_Curve', 'Poor_Surface_Ahead', 
+    'Slippery_Surface_Ahead', 'Road_Narrows_On_Right', 'Roadwork_Ahead', 
+    'Traffic_Light_Ahead', 'Warning_Pedestrians', 'Warning_Children', 
+    'Warning_Bikes', 'Ice_Snow', 'Deer_Crossing'
+]
+
+arrow_labels = [
+    'Turning_Right_Compulsory', 'Turning_Left_Compulsory', 'Ahead_Only', 
+    'Straight_Or_Right_Mandatory', 'Straight_Or_Left_Mandatory', 
+    'Passing_Right_Compulsory', 'Passing_Left_Compulsory', 'Roundabout'
+]
+```
+
+```{python}
+# === HIERARCHICAL ROUTING FUNCTION ===
+def hierarchical_inference_batched(image_batch):
+    """Run hierarchical inference on a full batch of images at once."""
+    router_preds = model_router.predict(image_batch, verbose=0)
+    predicted_families = np.argmax(router_preds, axis=1)
+
+    final_preds = np.zeros(len(image_batch), dtype=int)
+
+    family_to_model = {
+        'Family_Speed': (model_speed, speed_labels),
+        'Family_Arrow': (model_arrow, arrow_labels),
+        'Family_Hazard': (model_hazard, hazard_labels),
+    }
+
+    family_name_to_idx = {name: i for i, name in enumerate(router_labels)}
+
+    for family_name, (expert_model, expert_labels) in family_to_model.items():
+        family_idx = family_name_to_idx[family_name]
+        mask = predicted_families == family_idx
+        if not np.any(mask):
+            continue
+        expert_images = image_batch[mask]
+        expert_preds = expert_model.predict(expert_images, verbose=0)
+        expert_class_indices = np.argmax(expert_preds, axis=1)
+        for i, idx in enumerate(np.where(mask)[0]):
+            label_name = expert_labels[expert_class_indices[i]]
+            final_preds[idx] = target_names.index(label_name)
+
+    for family_name in ['STOP', 'Yield', 'No_Entry', 'Priority']:
+        family_idx = family_name_to_idx[family_name]
+        mask = predicted_families == family_idx
+        if not np.any(mask):
+            continue
+        if family_name == 'No_Entry':
+            final_preds[mask] = target_names.index('No_Entry(one-way traffic)')
+        elif family_name == 'Priority':
+            final_preds[mask] = target_names.index('Priority_Road_Ahead')
+        else:
+            final_preds[mask] = target_names.index(family_name)
+
+    return final_preds
+```
+
+## Prepare Test Data
+
+```{python}
+# === LOAD MINI HOLDOUT IMAGES AS A SINGLE BENCHMARK SET ===
+# We use the mini_holdout set so we have ground truth AND real images.
+# This gives us a realistic mix of all 43 classes.
+
+test_datagen = ImageDataGenerator(rescale=1./255, preprocessing_function=val_preprocessing)
+test_generator = test_datagen.flow_from_directory(
+    DATA_DIR,
+    classes=['mini_holdout'],
+    target_size=image_size,
+    batch_size=10000,   # grab all at once
+    class_mode='sparse',
+    shuffle=False
+)
+
+# Pull all images into memory as a single numpy array
+all_images, _ = test_generator[0]
+answers_df = pd.read_csv(mini_holdout_answers)
+y_true = answers_df['ClassId'].values
+
+print(f"Loaded {len(all_images)} test images, shape: {all_images.shape}")
+print(f"Ground truth labels: {len(y_true)}")
+```
+
+## Warm-up Run (exclude TF initialization overhead)
+
+```{python}
+# === WARM-UP ===
+# Run a small batch through each model once to warm up TF's graph/XLA,
+# so subsequent timings reflect steady-state performance.
+print("Warming up models (excluded from timings)...")
+_ = model_single.predict(all_images[:10], verbose=0)
+_ = hierarchical_inference_batched(all_images[:10])
+print("Warm-up complete.\n")
+```
+
+## Benchmark: Single Image Inference
+
+```{python}
+# ============================================================
+# BENCHMARK 1: SINGLE IMAGE (n=1)
+# ============================================================
+print("=" * 60)
+print("BENCHMARK 1 — Single Image Inference (n=1)")
+print("=" * 60)
+
+single_img = all_images[:1:2]  # shape (1, 100, 100, 3)
+
+# --- Single F1 model ---
+n_trials = 20
+times_single_1 = []
+for _ in range(n_trials):
+    t0 = time.perf_counter()
+    _ = model_single.predict(single_img, verbose=0)
+    t1 = time.perf_counter()
+    times_single_1.append(t1 - t0)
+
+# --- Hierarchical model ---
+times_hier_1 = []
+for _ in range(n_trials):
+    t0 = time.perf_counter()
+    _ = hierarchical_inference_batched(single_img)
+    t1 = time.perf_counter()
+    times_hier_1.append(t1 - t0)
+
+print(f"\n{'Model':<25} {'Mean (ms)':<12} {'Std (ms)':<12} {'Min (ms)':<12} {'Median (ms)':<12}")
+print("-" * 73)
+for name, times in [("Single F1", times_single_1), ("Hierarchical", times_hier_1)]:
+    t = np.array(times) * 1000
+    print(f"{name:<25} {t.mean():<12.2f} {t.std():<12.2f} {t.min():<12.2f} {np.median(t):<12.2f}")
+
+speedup_1 = np.median(times_hier_1) / np.median(times_single_1)
+print(f"\nHierarchical / Single ratio: {speedup_1:.2f}x")
+```
+
+## Benchmark: Batch Inference Across Multiple Sizes
+
+```{python}
+# ============================================================
+# BENCHMARK 2: BATCH INFERENCE ACROSS MULTIPLE SIZES
+# ============================================================
+print("\n" + "=" * 60)
+print("BENCHMARK 2 — Batch Inference (multiple sizes)")
+print("=" * 60)
+
+batch_sizes = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+# Cap at available images
+batch_sizes = [b for b in batch_sizes if b <= len(all_images)]
+
+n_repeats = 15  # number of repeats per batch size for averaging
+
+results = []
+
+for bs in batch_sizes:
+    batch = all_images[:bs]
+
+    # --- Single F1 ---
+    times_s = []
+    for _ in range(n_repeats):
+        t0 = time.perf_counter()
+        _ = model_single.predict(batch, verbose=0)
+        t0_end = time.perf_counter()
+        times_s.append(t0_end - t0)
+
+    # --- Hierarchical ---
+    times_h = []
+    for _ in range(n_repeats):
+        t0 = time.perf_counter()
+        _ = hierarchical_inference_batched(batch)
+        t0_end = time.perf_counter()
+        times_h.append(t0_end - t0)
+
+    med_s = np.median(times_s) * 1000
+    med_h = np.median(times_h) * 1000
+    per_img_s = med_s / bs
+    per_img_h = med_h / bs
+
+    results.append({
+        'batch_size': bs,
+        'single_total_ms': med_s,
+        'hier_total_ms': med_h,
+        'single_per_img_ms': per_img_s,
+        'hier_per_img_ms': per_img_h,
+        'ratio_total': med_h / med_s if med_s > 0 else float('inf'),
+        'ratio_per_img': per_img_h / per_img_s if per_img_s > 0 else float('inf'),
+    })
+
+results_df = pd.DataFrame(results)
+
+print(f"\n{'Batch':>6} | {'Single Total':>13} | {'Hier Total':>11} | "
+      f"{'Single/img':>11} | {'Hier/img':>9} | {'Ratio':>7} | {'Ratio/img':>10}")
+print("-" * 90)
+for _, r in results_df.iterrows():
+    print(f"{int(r['batch_size']):>6} | "
+          f"{r['single_total_ms']:>10.2f} ms | "
+          f"{r['hier_total_ms']:>8.2f} ms | "
+          f"{r['single_per_img_ms']:>8.4f} ms | "
+          f"{r['hier_per_img_ms']:>6.4f} ms | "
+          f"{r['ratio_total']:>5.2f}x | "
+          f"{r['ratio_per_img']:>7.2f}x")
+```
+
+## Visualization: Total Time vs Batch Size
+
+```{python}
+# === PLOT: Total inference time vs batch size ===
+fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+# Plot 1: Total time
+ax = axes[0]
+ax.plot(results_df['batch_size'], results_df['single_total_ms'], 'o-', label='Single F1', linewidth=2)
+ax.plot(results_df['batch_size'], results_df['hier_total_ms'], 's-', label='Hierarchical', linewidth=2)
+ax.set_xlabel('Batch Size')
+ax.set_ylabel('Total Time (ms)')
+ax.set_title('Total Inference Time vs Batch Size')
+ax.legend()
+ax.grid(True, alpha=0.3)
+ax.set_xscale('log', base=2)
+y_max = ax.get_ylim()[1]
+ax.set_ylim(0, y_max)
+ax.set_yticks(np.arange(0, y_max + 250, 250))
+
+
+# Plot 2: Per-image time
+ax = axes[1]
+ax.plot(results_df['batch_size'], results_df['single_per_img_ms'], 'o-', label='Single F1', linewidth=2)
+ax.plot(results_df['batch_size'], results_df['hier_per_img_ms'], 's-', label='Hierarchical', linewidth=2)
+ax.set_xlabel('Batch Size')
+ax.set_ylabel('Per-Image Time (ms)')
+ax.set_title('Per-Image Inference Time vs Batch Size')
+ax.legend()
+ax.grid(True, alpha=0.3)
+ax.set_xscale('log', base=2)
+
+plt.tight_layout()
+plt.show()
+```
+
+## Visualization: Side-by-Side Bar Chart
+
+```{python}
+# === PLOT: Side-by-side grouped bar chart ===
+fig, ax = plt.subplots(figsize=(12, 6))
+
+x = np.arange(len(results_df))
+width = 0.35
+
+bars1 = ax.bar(x - width/2, results_df['single_total_ms'], width, label='Single F1', color='#2196F3', alpha=0.85)
+bars2 = ax.bar(x + width/2, results_df['hier_total_ms'], width, label='Hierarchical', color='#FF9800', alpha=0.85)
+
+ax.set_xlabel('Batch Size')
+ax.set_ylabel('Median Total Time (ms)')
+ax.set_title('Model Inference Speed: Hierarchical vs Single F1')
+ax.set_xticks(x)
+ax.set_xticklabels(results_df['batch_size'].astype(int))
+ax.legend()
+ax.grid(True, alpha=0.3, axis='y')
+
+# Add value labels on bars
+for bar in bars1:
+    ax.annotate(f'{bar.get_height():.1f}',
+                xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                xytext=(0, 3), textcoords="offset points",
+                ha='center', va='bottom', fontsize=8)
+for bar in bars2:
+    ax.annotate(f'{bar.get_height():.1f}',
+                xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                xytext=(0, 3), textcoords="offset points",
+                ha='center', va='bottom', fontsize=8)
+
+plt.tight_layout()
+plt.show()
+```
+
+## Accuracy Comparison (Sanity Check)
+
+```{python}
+# ============================================================
+# ACCURACY COMPARISON — make sure both models agree on quality
+# ============================================================
+print("=" * 60)
+print("ACCURACY COMPARISON (mini holdout)")
+print("=" * 60)
+
+# Single F1 predictions
+single_preds = np.argmax(model_single.predict(all_images, verbose=0), axis=1)
+# Hierarchical predictions
+hier_preds = hierarchical_inference_batched(all_images)
+
+acc_single = accuracy_score(y_true, single_preds)
+acc_hier = accuracy_score(y_true, hier_preds)
+
+print(f"\nSingle F1 model accuracy:    {acc_single * 100:.2f}%")
+print(f"Hierarchical model accuracy: {acc_hier * 100:.2f}%")
+print(f"Accuracy difference:         {(acc_hier - acc_single) * 100:+.2f}%")
+
+# Agreement between the two models
+agreement = accuracy_score(single_preds, hier_preds)
+print(f"Inter-model agreement:       {agreement * 100:.2f}%")
+```
+
+## Summary Table
+
+```{python}
+# ============================================================
+# FINAL SUMMARY
+# ============================================================
+print("\n" + "=" * 70)
+print("FINAL SUMMARY")
+print("=" * 70)
+
+print(f"\nAccuracy:")
+print(f"  Single F1:    {acc_single*100:.2f}%")
+print(f"  Hierarchical: {acc_hier*100:.2f}%")
+
+print(f"\nSpeed (per-image, from largest batch):")
+largest = results_df.iloc[-1]
+print(f"  Single F1:    {largest['single_per_img_ms']:.4f} ms/image  ({1000/largest['single_per_img_ms']:.0f} img/s)")
+print(f"  Hierarchical: {largest['hier_per_img_ms']:.4f} ms/image  ({1000/largest['hier_per_img_ms']:.0f} img/s)")
+print(f"  Overhead:     {largest['ratio_per_img']:.2f}x slower per image")
+
+print(f"\nSpeed (single image, median of 20 trials):")
+s1 = np.median(times_single_1) * 1000
+h1 = np.median(times_hier_1) * 1000
+print(f"  Single F1:    {s1:.2f} ms")
+print(f"  Hierarchical: {h1:.2f} ms")
+print(f"  Overhead:     {h1/s1:.2f}x slower")
+
+print("\n" + "=" * 70)
+```
